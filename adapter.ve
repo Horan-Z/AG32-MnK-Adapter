@@ -1,0 +1,19 @@
+SYSCLK 200
+BUSCLK 40
+HSECLK 8
+
+USB0 device
+
+LED                     PIN_2 :OUTPUT
+
+o_kbd_SPI_Clk           PIN_42:OUTPUT
+i_kbd_SPI_MISO          PIN_43:INPUT
+o_kbd_SPI_MOSI          PIN_41:OUTPUT
+o_kbd_SPI_CS_n          PIN_29:OUTPUT
+i_kbd_CH374_INT_n       PIN_45:INPUT
+
+o_mouse_SPI_Clk         PIN_15:OUTPUT
+i_mouse_SPI_MISO        PIN_18:INPUT
+o_mouse_SPI_MOSI        PIN_17:OUTPUT
+o_mouse_SPI_CS_n        PIN_13:OUTPUT
+i_mouse_CH374_INT_n     PIN_19:INPUT
