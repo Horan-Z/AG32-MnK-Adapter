@@ -15,8 +15,8 @@
 #define ADDR_MOUSE_D1 (MMIO_BASE + 0x0C)
 #define ADDR_MOUSE_D2 (MMIO_BASE + 0x10)
 
-#define XINPUT_MOUSE_TO_STICK_SCALE 48
-#define XINPUT_MOUSE_TO_STICK_SCALE_X5 180
+#define XINPUT_MOUSE_TO_STICK_SCALE 40
+#define XINPUT_MOUSE_TO_STICK_SCALE_LOOT 180
 
 #define XINPUT_STICK_MAX  32767
 #define XINPUT_STICK_MIN -32767
@@ -152,6 +152,18 @@ static void build_xinput_report(const raw_input_state_t *in, ReportDataXinput *o
     uint16_t buttons = 0;
     int16_t temp_x = 0, temp_y = 0, recoil_offset = 0;
     uint8_t wasd = 0;
+
+    static uint8_t jitter_tick = 0;
+    static int16_t current_jitter_amp = 990;
+    int16_t jitter = 0;
+
+    if(jitter_tick >= 15) {
+        current_jitter_amp = -current_jitter_amp;
+        jitter_tick = 0;
+    } else {
+        jitter_tick++;
+    }
+
     if (in->kbd_modifier & ((1u << 0) | (1u << 4))) buttons |= XBOX_BUTTON_B;   // Ctrl
     if (in->kbd_modifier & ((1u << 2) | (1u << 3))) buttons |= XBOX_BUTTON_DOWN;// Alt
     if (in->kbd_modifier & ((1u << 1) | (1u << 5))) buttons |= XBOX_BUTTON_L3;  // Shift
@@ -168,8 +180,8 @@ static void build_xinput_report(const raw_input_state_t *in, ReportDataXinput *o
         out->r_y = s_ly_lut[wasd & 0x0F];
         if(in->mouse_wheel < 0) out->r_y = -32767;
         if(in->mouse_wheel > 0) out->r_y = 32767;
-        square_to_circle_int(clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE_X5),
-                         clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE_X5),
+        square_to_circle_int(clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE_LOOT),
+                         clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE_LOOT),
                          &temp_x, &temp_y);
         out->l_x = temp_x;
         out->l_y = temp_y;
@@ -178,12 +190,12 @@ static void build_xinput_report(const raw_input_state_t *in, ReportDataXinput *o
     } else { // 正常视角映射
         out->l_x = s_lx_lut[wasd & 0x0F];
         out->l_y = s_ly_lut[wasd & 0x0F];
-        if (in->mouse_buttons & (1u << 0)) { out->rt = 255; recoil_offset = -200; }
-        if (in->mouse_buttons & (1u << 1)) { out->lt = 255; recoil_offset *= 4; } 
+        if (in->mouse_buttons & (1u << 0)) { out->rt = 255; recoil_offset = -200; jitter = current_jitter_amp;}
+        if (in->mouse_buttons & (1u << 1)) { out->lt = 255; recoil_offset *= 4;} 
         if (in->mouse_buttons & (1u << 2)) buttons |= XBOX_BUTTON_RB;
         if (in->mouse_buttons & (1u << 3)) buttons |= XBOX_BUTTON_UP;
         if (in->mouse_wheel != 0)          buttons |= XBOX_BUTTON_Y;
-        square_to_circle_int(clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE),
+        square_to_circle_int(clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE + jitter),
                              clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE + recoil_offset),
                              &temp_x, &temp_y);
         out->r_x = temp_x;
