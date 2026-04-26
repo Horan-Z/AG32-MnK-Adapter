@@ -23,6 +23,11 @@
 #define XINPUT_STICK_DIAG  23170
 #define XINPUT_STICK_DIAG_N -23170
 
+#define MAX_DX 820
+#define NUM_INTERVALS 20
+#define DX_STEP (MAX_DX / NUM_INTERVALS) // 41
+#define MAX_OUT 32767
+
 #define XBOX_BUTTON_UP     (1 << 0)
 #define XBOX_BUTTON_DOWN   (1 << 1)
 #define XBOX_BUTTON_LEFT   (1 << 2)
@@ -93,6 +98,57 @@ static ReportDataXinput send_pkt __attribute__((aligned(4)));;
 
 static uint8_t endpoint_in = 0;
 static uint8_t endpoint_out = 0;
+
+// 全局的动态查表数组，共 21 个锚点 (0 到 20)
+static int16_t s_dynamic_curve_lut[NUM_INTERVALS + 1];
+
+// sag_level: 0 (无下陷，纯线性) 到 100 (最大下陷，抛物线)
+void update_mouse_curve(int32_t sag_level) {
+    // 限制参数范围
+    if (sag_level < 0) sag_level = 0;
+    if (sag_level > 100) sag_level = 100;
+
+    for (int i = 0; i <= NUM_INTERVALS; i++) {
+        int32_t x = i * DX_STEP;
+        
+        // 1. 计算纯线性值 (相当于 dx * 40)
+        int32_t y_lin = (x * MAX_OUT) / MAX_DX; // 接近 x * 40
+        if (y_lin > MAX_OUT) y_lin = MAX_OUT;
+        
+        // 2. 计算二次方曲线值 (y = x^2 * MAX_OUT / MAX_DX^2)
+        // 使用 64 位整数防止 x^2 * MAX_OUT 溢出
+        int64_t x64 = x;
+        int64_t max_dx64 = MAX_DX;
+        int32_t y_quad = (int32_t)((x64 * x64 * MAX_OUT) / (max_dx64 * max_dx64));
+        
+        // 3. 根据 sag_level 混合这两种模型
+        int32_t y_final = y_lin + ((y_quad - y_lin) * sag_level) / 100;
+        
+        s_dynamic_curve_lut[i] = (int16_t)y_final;
+    }
+}
+
+static inline int16_t apply_dynamic_curve(int32_t raw_delta) {
+    int32_t abs_d = (raw_delta > 0) ? raw_delta : -raw_delta;
+    
+    // 封顶，超过 820 直接输出最大值
+    if (abs_d >= MAX_DX) {
+        return (raw_delta > 0) ? MAX_OUT : -MAX_OUT;
+    }
+    
+    // 计算所在区间和余数
+    int32_t index = abs_d / DX_STEP; 
+    int32_t rem = abs_d % DX_STEP;
+    
+    // 获取区间两端的锚点
+    int32_t y0 = s_dynamic_curve_lut[index];
+    int32_t y1 = s_dynamic_curve_lut[index + 1];
+    
+    // 整数线性插值
+    int16_t mapped_val = (int16_t)(y0 + ((y1 - y0) * rem) / DX_STEP);
+    
+    return (raw_delta > 0) ? mapped_val : -mapped_val;
+}
 
 static inline int16_t clamp_s16(int32_t v) {
     if (v > 32767) return 32767;
@@ -195,8 +251,10 @@ static void build_xinput_report(const raw_input_state_t *in, ReportDataXinput *o
         if (in->mouse_buttons & (1u << 2)) buttons |= XBOX_BUTTON_RB;
         if (in->mouse_buttons & (1u << 3)) buttons |= XBOX_BUTTON_UP;
         if (in->mouse_wheel != 0)          buttons |= XBOX_BUTTON_Y;
-        square_to_circle_int(clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE + jitter),
-                             clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE + recoil_offset),
+        int16_t curve_x = apply_dynamic_curve(in->mouse_dx);
+        int16_t curve_y = apply_dynamic_curve(-in->mouse_dy); // 注意反转
+        square_to_circle_int(clamp_s16(curve_x + jitter),
+                             clamp_s16(curve_y + recoil_offset),
                              &temp_x, &temp_y);
         out->r_x = temp_x;
         out->r_y = temp_y;
@@ -256,6 +314,8 @@ void LOCAL_INT0_isr(void) {
 
 int main(void) {
   board_init();
+
+  update_mouse_curve(40);
 
   INT_EnableIntLocal(LOCAL_INT0_IRQn);
   INT_EnableIRQ(LOCAL_INT0_IRQn, PLIC_MAX_PRIORITY);
