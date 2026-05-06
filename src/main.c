@@ -244,11 +244,22 @@ static void build_xinput_report(const raw_input_state_t *in, ReportDataXinput *o
         out->r_y = s_ly_lut[wasd & 0x0F];
         if(in->mouse_wheel < 0) out->r_y = -32767;
         if(in->mouse_wheel > 0) out->r_y = 32767;
-        square_to_circle_int(clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE_LOOT),
-                         clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE_LOOT),
-                         &temp_x, &temp_y);
+
+        int16_t target_loot_x = clamp_s16(in->mouse_dx * XINPUT_MOUSE_TO_STICK_SCALE_LOOT);
+        int16_t target_loot_y = clamp_s16(-in->mouse_dy * XINPUT_MOUSE_TO_STICK_SCALE_LOOT);
+        static int32_t smooth_loot_x_fp = 0;
+        static int32_t smooth_loot_y_fp = 0;
+        const  uint8_t EMA_SHIFT_LOOT = 1;
+
+        smooth_loot_x_fp += (( (int32_t)target_loot_x << 8 ) - smooth_loot_x_fp) >> EMA_SHIFT_LOOT;
+        smooth_loot_y_fp += (( (int32_t)target_loot_y << 8 ) - smooth_loot_y_fp) >> EMA_SHIFT_LOOT;
+        int32_t final_loot_x = (int16_t)(smooth_loot_x_fp >> 8);
+        int32_t final_loot_y = (int16_t)(smooth_loot_y_fp >> 8);
+
+        square_to_circle_int(final_loot_x, final_loot_y, &temp_x, &temp_y);
         out->l_x = temp_x;
         out->l_y = temp_y;
+        
         if (in->mouse_buttons & (1u << 0)) buttons |= XBOX_BUTTON_A;
         if (in->mouse_buttons & (1u << 1)) buttons |= XBOX_BUTTON_X;
     } else { // 正常视角映射
