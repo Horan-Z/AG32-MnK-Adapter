@@ -259,10 +259,19 @@ static void build_xinput_report(const raw_input_state_t *in, ReportDataXinput *o
         if (in->mouse_buttons & (1u << 2)) buttons |= XBOX_BUTTON_RB;
         if (in->mouse_buttons & (1u << 3)) buttons |= XBOX_BUTTON_UP;
         if (in->mouse_wheel != 0)          buttons |= XBOX_BUTTON_Y;
-        int16_t curve_x = apply_dynamic_curve(in->mouse_dx, is_ads);
-        int16_t curve_y = apply_dynamic_curve(-in->mouse_dy, is_ads); // 注意反转
-        square_to_circle_int(clamp_s16(curve_x + jitter),
-                             clamp_s16(curve_y + recoil_offset),
+        int16_t target_x = apply_dynamic_curve(in->mouse_dx, is_ads);
+        int16_t target_y = apply_dynamic_curve(-in->mouse_dy, is_ads); // 注意反转
+
+        static int32_t smooth_x_fp = 0;
+        static int32_t smooth_y_fp = 0;
+        const  uint8_t EMA_SHIFT = 1;
+        smooth_x_fp += (( (int32_t)target_x << 8 ) - smooth_x_fp) >> EMA_SHIFT;
+        smooth_y_fp += (( (int32_t)target_y << 8 ) - smooth_y_fp) >> EMA_SHIFT;
+        int32_t final_x = (int16_t)(smooth_x_fp >> 8);
+        int32_t final_y = (int16_t)(smooth_y_fp >> 8);
+
+        square_to_circle_int(clamp_s16(final_x + jitter),
+                             clamp_s16(final_y + recoil_offset),
                              &temp_x, &temp_y);
         out->r_x = temp_x;
         out->r_y = temp_y;
