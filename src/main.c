@@ -16,7 +16,7 @@
 #define ADDR_MOUSE_D2 (MMIO_BASE + 0x10)
 
 #define XINPUT_MOUSE_TO_STICK_SCALE_HIP 40
-#define XINPUT_MOUSE_TO_STICK_SCALE_ADS 20
+#define XINPUT_MOUSE_TO_STICK_SCALE_ADS 25
 #define XINPUT_MOUSE_TO_STICK_SCALE_LOOT 180
 
 #define XINPUT_STICK_MAX  32767
@@ -265,8 +265,8 @@ static void build_xinput_report(const raw_input_state_t *in, ReportDataXinput *o
     } else { // 正常视角映射
         out->l_x = s_lx_lut[wasd & 0x0F];
         out->l_y = s_ly_lut[wasd & 0x0F];
-        if (in->mouse_buttons & (1u << 0)) { out->rt = 255; recoil_offset = -200; jitter = current_jitter_amp;}
-        if (in->mouse_buttons & (1u << 1)) { out->lt = 255; recoil_offset *= 4; is_ads = true;} 
+        if (in->mouse_buttons & (1u << 0)) { out->rt = 255; recoil_offset = -250; jitter = current_jitter_amp;}
+        if (in->mouse_buttons & (1u << 1)) { out->lt = 255; recoil_offset *= 2; is_ads = true;} 
         if (in->mouse_buttons & (1u << 2)) buttons |= XBOX_BUTTON_RB;
         if (in->mouse_buttons & (1u << 3)) buttons |= XBOX_BUTTON_UP;
         if (in->mouse_wheel != 0)          buttons |= XBOX_BUTTON_Y;

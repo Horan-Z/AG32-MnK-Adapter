@@ -92,7 +92,7 @@ char const *string_desc_arr_xinput[] = {
     (const char[]){0x09, 0x04}, // 0: is supported language is English (0x0409)
     "Microsoft",                  // 1: Manufacturer
     "Xbox 360 Controller",        // 2: Product
-    "172040153891"                // 3: Serials
+    "920743661504"                // 3: Serials
 };
 
 #endif
