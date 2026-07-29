@@ -14,6 +14,9 @@
 #define ADDR_KBD_D2   (MMIO_BASE + 0x08)
 #define ADDR_MOUSE_D1 (MMIO_BASE + 0x0C)
 #define ADDR_MOUSE_D2 (MMIO_BASE + 0x10)
+#define ADDR_MOUSE_CFG (MMIO_BASE + 0x14)
+
+#define HID_KEY_F1 0x3A
 
 #define XINPUT_MOUSE_TO_STICK_SCALE_HIP 40
 #define XINPUT_MOUSE_TO_STICK_SCALE_ADS 25
@@ -101,13 +104,52 @@ typedef struct {
 
 static volatile raw_input_state_t local_in;
 
-static ReportDataXinput send_pkt __attribute__((aligned(4)));;
+static ReportDataXinput send_pkt __attribute__((aligned(4)));
 
 static uint8_t endpoint_in = 0;
 static uint8_t endpoint_out = 0;
 
 static int16_t s_lut_hip[NUM_INTERVALS + 1];
 static int16_t s_lut_ads[NUM_INTERVALS + 1];
+
+// ==========================================================
+// 鼠标 Profile 表（MCU 侧存储，F1 键切换）
+// ==========================================================
+typedef struct {
+    uint8_t report_len;       // 期望的 USB 报告长度
+    uint8_t useful_data_len;  // 实际读取字节数
+    uint8_t interval;         // 轮询周期(ms)
+    uint8_t btn_offset;       // 按键域起始字节(2字节, LE)
+    uint8_t x_offset;         // X 域起始字节(2字节, LE, signed)
+    uint8_t y_offset;         // Y 域起始字节(2字节, LE, signed)
+    uint8_t wheel_offset;     // 滚轮域字节(1字节, signed)
+    const char *name;
+} mouse_profile_t;
+
+static const mouse_profile_t s_mouse_profiles[] = {
+    {
+        .report_len       = 13,
+        .useful_data_len  = 7,
+        .interval          = 1,
+        .btn_offset        = 0,
+        .x_offset          = 2,
+        .y_offset          = 4,
+        .wheel_offset      = 6,
+        .name              = "Default"
+    },
+};
+#define NUM_MOUSE_PROFILES (sizeof(s_mouse_profiles) / sizeof(s_mouse_profiles[0]))
+
+static volatile uint8_t s_current_profile = 0;
+static bool s_f1_was_pressed = false;
+
+static void apply_mouse_profile(uint8_t index) {
+    const mouse_profile_t *p = &s_mouse_profiles[index];
+    uint32_t cfg = (uint32_t)p->report_len
+                 | ((uint32_t)p->useful_data_len << 8)
+                 | ((uint32_t)p->interval << 16);
+    *((volatile uint32_t *)ADDR_MOUSE_CFG) = cfg;
+}
 
 void update_mouse_curve(int32_t sag_level) {
     if (sag_level < 0) sag_level = 0;
@@ -294,9 +336,7 @@ static void build_xinput_report(const raw_input_state_t *in, ReportDataXinput *o
 
 void LOCAL_INT0_isr(void) {
     uint32_t status;
-    int8_t raw_wheel_inc = 0; 
     
-    // 只要有状态，就一直处理，防漏拍
     while ((status = *((volatile uint32_t *)ADDR_STATUS)) != 0) {
 
         __sync_synchronize();
@@ -316,20 +356,39 @@ void LOCAL_INT0_isr(void) {
             local_in.kbd_modifier   = (uint8_t)(k2 & 0xFF);
             local_in.kbd_keycode[4] = (uint8_t)((k2 >> 8) & 0xFF);
             local_in.kbd_keycode[5] = (uint8_t)((k2 >> 16) & 0xFF);
+
+            // F1 键切换鼠标 profile（边沿检测，按下瞬间触发一次）
+            bool f1_pressed = false;
+            for (uint8_t i = 0; i < 6; i++) {
+                if (local_in.kbd_keycode[i] == HID_KEY_F1) {
+                    f1_pressed = true;
+                    break;
+                }
+            }
+            if (f1_pressed && !s_f1_was_pressed) {
+                s_current_profile = (s_current_profile + 1) % NUM_MOUSE_PROFILES;
+                apply_mouse_profile(s_current_profile);
+            }
+            s_f1_was_pressed = f1_pressed;
         }
         
-        // 鼠标数据有更新
+        // 鼠标数据有更新（原始字节，按当前 profile 解析）
         if (status & 0x02) { 
             uint32_t m1 = *((volatile uint32_t *)ADDR_MOUSE_D1);
             uint32_t m2 = *((volatile uint32_t *)ADDR_MOUSE_D2);
             
-            // 解析 D1 (X 和 Y 位移，需要累加)
-            local_in.mouse_dx += (int16_t)(m1 & 0xFFFF);
-            local_in.mouse_dy += (int16_t)((m1 >> 16) & 0xFFFF);
-            
-            // 解析 D2 (按钮和滚轮)
-            local_in.mouse_buttons = (uint16_t)(m2 & 0xFFFF);
-            raw_wheel_inc = (int8_t)((m2 >> 16) & 0xFF);
+            uint8_t raw[8] = {
+                (uint8_t)(m1),       (uint8_t)(m1 >> 8),
+                (uint8_t)(m1 >> 16), (uint8_t)(m1 >> 24),
+                (uint8_t)(m2),       (uint8_t)(m2 >> 8),
+                (uint8_t)(m2 >> 16), (uint8_t)(m2 >> 24),
+            };
+
+            const mouse_profile_t *p = &s_mouse_profiles[s_current_profile];
+            local_in.mouse_dx     += (int16_t)(raw[p->x_offset] | (raw[p->x_offset + 1] << 8));
+            local_in.mouse_dy     += (int16_t)(raw[p->y_offset] | (raw[p->y_offset + 1] << 8));
+            local_in.mouse_buttons= raw[p->btn_offset] | (raw[p->btn_offset + 1] << 8);
+            int8_t raw_wheel_inc  = (int8_t)raw[p->wheel_offset];
             local_in.mouse_wheel += (int16_t)raw_wheel_inc << 5;
         }
 
@@ -351,6 +410,7 @@ int main(void) {
   tusb_init();
   bool first_packet_sent = false;
   memset((void*)&local_in, 0, sizeof(local_in));
+  apply_mouse_profile(0);
   
   while (1) {
     tud_task();
@@ -374,7 +434,7 @@ int main(void) {
 static void xinput_init(void) { }
 static void xinput_reset(uint8_t __unused rhport) { }
 static uint16_t xinput_open(uint8_t __unused rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len) {
-  // ... 保持你的原始代码逻辑 ...
+  // 从配置描述符中解析端点：drv_len = 接口描述符 + 端点描述符 × bNumEndpoints + 16 字节未知描述符(XInput特有)
   uint16_t const drv_len = sizeof(tusb_desc_interface_t) + itf_desc->bNumEndpoints*sizeof(tusb_desc_endpoint_t) + 16;
   TU_VERIFY(max_len >= drv_len, 0);
 

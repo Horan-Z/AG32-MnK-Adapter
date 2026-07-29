@@ -1,5 +1,7 @@
 # AGENTS.md
 
+> **分支说明**：`experiment/mcu-mouse-config` — 实验分支。鼠标参数（report_len / useful_data_len / interval）从 Verilog 硬编码改为 MCU 运行时配置寄存器，鼠标报告解析从 FPGA 侧移至 MCU 侧，支持 F1 键切换鼠标 profile。主分支 `main` 仍为稳定版本。
+
 面向在本仓库工作的 AI / 自动化编码代理的开发指南：项目是什么、代码如何组织、各模块内部怎么运转、构建方式、以及改动时必须遵守的约定。
 
 ## 项目简介
@@ -43,25 +45,27 @@
      └─ SPI (CLK/MOSI/MISO/CS + INT#)          logic/SPI_Master*.v
          └─ CH374-SPI 协议层 (req/resp + task)  logic/*_Receiver.v 第三部分
              └─ USB 主状态机 (枚举→轮询→解析)    logic/*_Receiver.v 第五/六部分
-                 └─ 内部数据总线 w_kbd_* / w_mouse_*
+                 └─ 内部数据总线 w_kbd_* / w_mouse_raw[63:0]
                      └─ 寄存器堆 + W1C 状态 + local_int[0]   logic/analog_ip.v
                          └─ ahb2apb 桥 → 映射到 0x6000_0000
                              └─ LOCAL_INT0 ISR 排空数据       src/main.c
-                                 └─ build_xinput_report() 换算
-                                     └─ TinyUSB IN 端点 → 主机
+                                 └─ (鼠标按 profile 解析 raw 字节)
+                                     └─ build_xinput_report() 换算
+                                         └─ TinyUSB IN 端点 → 主机
 ```
 
 ### 寄存器映射（逻辑侧 `analog_ip.v` 的 `ADDR_*` ↔ MCU 侧 `main.c` 的 `ADDR_*` 宏，基址 `0x60000000`）
 
-| 偏移   | 名称     | 内容 |
-|--------|----------|------|
-| `0x00` | STATUS   | **W1C**（写 1 清零）：bit0=键盘更新，bit1=鼠标更新。非 0 时 `local_int[0]` 持续拉高 |
-| `0x04` | KBD_D1   | `keys[31:0]`（keycode 0~3） |
-| `0x08` | KBD_D2   | `{8'b0, keys[47:32]（keycode 4~5）, modifier[7:0]}` |
-| `0x0C` | MOUSE_D1 | `{y[15:0], x[15:0]}`（有符号增量） |
-| `0x10` | MOUSE_D2 | `{8'b0, wheel[7:0], buttons[15:0]}` |
+| 偏移   | 名称       | 内容 |
+|--------|------------|------|
+| `0x00` | STATUS     | **W1C**（写 1 清零）：bit0=键盘更新，bit1=鼠标更新。非 0 时 `local_int[0]` 持续拉高 |
+| `0x04` | KBD_D1     | `keys[31:0]`（keycode 0~3） |
+| `0x08` | KBD_D2     | `{8'b0, keys[47:32]（keycode 4~5）, modifier[7:0]}` |
+| `0x0C` | MOUSE_D1   | raw 字节 0~3（MCU 按 profile 解析） |
+| `0x10` | MOUSE_D2   | raw 字节 4~7（MCU 按 profile 解析） |
+| `0x14` | MOUSE_CFG  | **MCU 只写**：`{8'b0, interval[7:0], useful_data_len[7:0], report_len[7:0]}`。上电默认 `13/7/1` |
 
-握手语义：数据 `valid` 脉冲锁存数据并置位 status；MCU 在 ISR 里 `while(status != 0)` 循环读取，并把读到的 status **原样写回**触发 W1C。键盘寄存器是绝对状态（覆盖式），鼠标 x/y/wheel 由 MCU 侧累加。
+握手语义：数据 `valid` 脉冲锁存数据并置位 status；MCU 在 ISR 里 `while(status != 0)` 循环读取，并把读到的 status **原样写回**触发 W1C。键盘寄存器是绝对状态（覆盖式），鼠标 raw 字节由 MCU 侧按当前 profile 解析后累加 dx/dy/wheel、覆盖 buttons。
 
 ## 逻辑侧详解（logic/）
 
@@ -73,6 +77,7 @@
 - `local_int[0] = (status != 0)`（电平中断）；`local_int[3:1]` 恒 0。
 - `LED`：键鼠均无数据时点亮（调试指示）。
 - 关键参数：`BUS_CLK_FREQ=40_000_000`、`SPI_CLKS_PER_HALF_BIT=2`（→ SCK = 10MHz）。
+- **鼠标配置寄存器**（`ADDR_MOUSE_CFG`）：MCU 通过 APB 写入 `report_len / useful_data_len / interval`，receiver 在下一轮询周期自动生效。上电默认 `{13, 7, 1}` 匹配当前已知鼠标。
 
 ### Kbd_Receiver.v / Mouse_Receiver.v — 核心（两者结构对称，约 95% 相同）
 
@@ -104,15 +109,17 @@ S_IDLE → S_PWR_WAIT(50ms) → S_CHIP_RST(0x4C 复位/0x44 解除) → S_HOST_C
 - `ep1_in_toggle` 本地跟踪 DATA0/DATA1，`ep1_expected_pid` 据此过滤重复包。
 - 任何阶段 `timeout_flag` 或异常 PID → `S_ERROR`：输出清零 + `valid` 脉冲一次，250ms 后回 `S_IDLE` 重新枚举。
 
-**设备相关参数**（换不同键鼠时可能需要调）：
+**设备相关参数**：
 
 | | Kbd_Receiver | Mouse_Receiver |
 |---|---|---|
-| `REPORT_LEN`（长度校验） | 8 | 13 |
-| `USEFUL_DATA_LEN`（实读字节） | 8 | 7 |
-| `INTERVAL`（轮询周期） | 1ms | 1ms |
-| 输出 | `o_kbd_modifiers[7:0]` + `o_kbd_keys[47:0]`（6 keycode） | `o_mouse_buttons[15:0]`、`o_mouse_x/y`（signed16）、`o_mouse_wheel`（signed8） |
-| 解析位置 | `S_POLL_EP1_READ` 内位拼接 | 同左 |
+| `REPORT_LEN`（长度校验） | 8（parameter 固定） | **MCU 可配**（`i_cfg_report_len`，默认 13） |
+| `USEFUL_DATA_LEN`（实读字节） | 8（parameter 固定） | **MCU 可配**（`i_cfg_useful_data_len`，默认 7；buffer 固定 8 字节） |
+| `INTERVAL`（轮询周期） | 1ms（parameter 固定） | **MCU 可配**（`i_cfg_interval`，默认 1ms） |
+| 输出 | `o_kbd_modifiers[7:0]` + `o_kbd_keys[47:0]`（6 keycode） | `o_mouse_raw[63:0]`（8 字节原始报告，MCU 侧按 profile 解析） |
+| 解析位置 | `S_POLL_EP1_READ` 内位拼接 | **MCU 侧 ISR**（按 `mouse_profile_t` 的字节偏移解析） |
+
+> 鼠标参数已从 Verilog parameter 改为 MCU 运行时配置寄存器，**换鼠标不再需要重新综合逻辑**——只需在 `main.c` 的 `s_mouse_profiles[]` 表中添加一条 profile，按 F1 切换。键盘参数仍为编译期固定（boot 协议，值不变）。
 
 ### 通用 / 厂商模块（一般不改）
 
@@ -124,7 +131,17 @@ S_IDLE → S_PWR_WAIT(50ms) → S_CHIP_RST(0x4C 复位/0x44 解除) → S_HOST_C
 
 ### 中断取数
 
-`LOCAL_INT0_isr`：循环读 STATUS，按位分别解析 KBD_D1/D2（覆盖 `local_in` 的键码/修饰键）与 MOUSE_D1/D2（**累加** dx/dy/wheel，覆盖 buttons），最后把 status 原样写回清中断。`main()` 中通过 `INT_EnableIntLocal/EnableIRQ(LOCAL_INT0_IRQn, PLIC_MAX_PRIORITY)` 使能。
+`LOCAL_INT0_isr`：循环读 STATUS，按位分别处理：
+- **键盘**（bit0）：解析 KBD_D1/D2（覆盖 `local_in` 的键码/修饰键），然后做 F1 边沿检测（见下）。
+- **鼠标**（bit1）：读 MOUSE_D1/D2 原始字节，按当前 profile 的字节偏移解析出 buttons/dx/dy/wheel，**累加** dx/dy/wheel、覆盖 buttons。
+最后把 status 原样写回清中断。`main()` 中通过 `INT_EnableIntLocal/EnableIRQ(LOCAL_INT0_IRQn, PLIC_MAX_PRIORITY)` 使能。
+
+### 鼠标 Profile 系统
+
+- `mouse_profile_t` 结构体包含 `report_len / useful_data_len / interval / btn_offset / x_offset / y_offset / wheel_offset / name`。
+- `s_mouse_profiles[]` 数组存储所有已知鼠标的 profile（当前仅 1 条）。
+- **F1 键**（HID keycode `0x3A`）切换 profile：ISR 内边沿检测，按下瞬间 `s_current_profile` 循环递增，调用 `apply_mouse_profile()` 写 `ADDR_MOUSE_CFG` 寄存器。FPGA receiver 在下一个轮询周期自动生效，**无需重新枚举**。
+- `main()` 启动时调用 `apply_mouse_profile(0)` 同步默认配置到 FPGA。
 
 ### 换算流水线（`build_xinput_report`，每次 USB 传输完成调用一次）
 
@@ -165,9 +182,9 @@ pio device monitor      # 串口监视
 - **寄存器映射双处同步**：`analog_ip.v` 的 `ADDR_*` 与 `main.c` 的 `ADDR_*` 宏（含位域布局）必须一致。
 - **引脚三处对应**：`adapter.ve`（引脚名↔PIN 号）、`analog_ip.v`（端口名）、PCB（`LCEDA project/`）。
 - **W1C 语义不可破坏**：ISR 必须把读到的 status 原样写回；改状态寄存器/ISR 时保证"数据 valid 优先于 W1C"。
-- **两个 receiver 对称**：SPI 协议层、枚举、轮询、超时逻辑几乎逐行相同，改一处通常要同步另一处；差异仅在 Set_Protocol 状态群（仅键盘）、`REPORT_LEN/USEFUL_DATA_LEN`、`S_POLL_EP1_READ` 的解析位拼接、输出端口。
+- **两个 receiver 对称**：SPI 协议层、枚举、轮询、超时逻辑几乎逐行相同，改一处通常要同步另一处；差异仅在 Set_Protocol 状态群（仅键盘）、鼠标的 MCU 可配置参数（`i_cfg_*` 输入端口，仅鼠标有）、`S_POLL_EP1_READ` 的输出方式（键盘位拼接 / 鼠标 raw 透传）。
 - **receiver 内新增 SPI 交互**遵循现有范式：状态内用 `op_step` 编号子步骤，`spi_req_ready && !spi_req_valid` 时发请求、`spi_resp_valid` 时收应答，完成置 `OP_FINISH`，异常置 `OP_ERR`/走 `timeout_flag`。
-- **换键鼠设备**：确认其 boot 报文长度，调 `REPORT_LEN/USEFUL_DATA_LEN` 并核对解析拼接；低速/全速由枚举自动测速处理，无需改。
+- **换鼠标设备**：在 `main.c` 的 `s_mouse_profiles[]` 表中添加一条 profile（含 report_len / useful_data_len / interval / 字节偏移），按 F1 切换即可，**无需重新综合逻辑**；低速/全速由枚举自动测速处理。换键盘仍需确认 boot 报文长度并改 `Kbd_Receiver.v` 的 parameter。
 - 手感参数（键位 LUT、scale、sag、jitter、recoil）集中在 `main.c` 前部与 `build_xinput_report` 内，调参优先改这些常量。
 
 ## 常见改动速查
@@ -177,9 +194,9 @@ pio device monitor      # 串口监视
 | 增删按键映射 | `main.c`：`s_key_lut_btn`（HID keycode → Xbox 按键位）、`s_key_lut_wasd` |
 | 调鼠标灵敏度/曲线 | `main.c`：`XINPUT_MOUSE_TO_STICK_SCALE_{HIP,ADS,LOOT}`、`update_mouse_curve(sag_level)` |
 | 调压枪/抖动/平滑 | `main.c` `build_xinput_report`：`recoil_offset`、`current_jitter_amp`、`EMA_SHIFT` |
-| 改轮询周期 | `analog_ip.v` 例化处的 `INTERVAL`（经参数传入 receiver） |
+| 改轮询周期 | `main.c`：`s_mouse_profiles[]` 的 `interval` 字段（经 `ADDR_MOUSE_CFG` 写入 FPGA） |
 | 改 SPI 频率 | `analog_ip.v` 的 `SPI_CLKS_PER_HALF_BIT`（SCK = BUSCLK / (4×该值)） |
-| 换键鼠设备 | receiver 的 `REPORT_LEN/USEFUL_DATA_LEN` + `S_POLL_EP1_READ` 解析 |
+| 换鼠标设备 | `main.c`：在 `s_mouse_profiles[]` 加一条 profile（report_len / useful_data_len / interval / 字节偏移），按 F1 切换。**不需要重新综合逻辑** |
 | 改引脚 | `adapter.ve`（并核对 `analog_ip.v` 端口与 PCB） |
 | 改寄存器接口 | `analog_ip.v` 寄存器堆 + `main.c` 宏与 ISR 解析，同步改 |
 | 改 USB 身份/报文 | `descriptor_xinput.h`、`XInputPad.h`（注意主机按 VID/PID 缓存驱动） |

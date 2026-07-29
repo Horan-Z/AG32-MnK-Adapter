@@ -44,11 +44,8 @@ module analog_ip (
   output tri0 [3:0]  local_int
 );
 
-// --- 鼠标数据内部总线 ---
-wire [15:0]          w_mouse_buttons;
-wire signed [15:0]   w_mouse_x;
-wire signed [15:0]   w_mouse_y;
-wire signed [7:0]    w_mouse_wheel;
+// --- 鼠标数据内部总线（原始字节透传，MCU 侧解析） ---
+wire [63:0]          w_mouse_raw;
 wire                 w_mouse_data_valid;
 
 // --- 键盘数据内部总线 ---
@@ -129,8 +126,9 @@ ahb2apb #(ADDR_BITS, DATA_BITS) ahb2apb_inst(
 parameter ADDR_STATUS   = 12'h00; // 状态(W1C): bit0=键盘更新, bit1=鼠标更新
 parameter ADDR_KBD_D1   = 12'h04; // 键盘数据1: { 32位Keys[31:0]}
 parameter ADDR_KBD_D2   = 12'h08; // 键盘数据2: { 8位留空 | 16位Keys[47:32] | 8位修饰键 }
-parameter ADDR_MOUSE_D1 = 12'h0C; // 鼠标数据1: { 16位Y坐标 | 16位X坐标 }
-parameter ADDR_MOUSE_D2 = 12'h10; // 鼠标数据2: { 8位留空 | 8位滚轮 | 16位按键 }
+parameter ADDR_MOUSE_D1 = 12'h0C; // 鼠标数据1: raw 字节 0~3（MCU 按 profile 解析）
+parameter ADDR_MOUSE_D2 = 12'h10; // 鼠标数据2: raw 字节 4~7（MCU 按 profile 解析）
+parameter ADDR_MOUSE_CFG = 12'h14; // 鼠标配置(MCU可写): {8'b0, interval[7:0], useful_data_len[7:0], report_len[7:0]}
 
 // ==========================================================
 // 内部锁存与影子寄存器
@@ -141,7 +139,12 @@ reg [31:0] reg_kbd_d2;
 reg [31:0] reg_mouse_d1;
 reg [31:0] reg_mouse_d2;
 
-assign LED = (reg_kbd_d1 | reg_kbd_d2 | {16'h0000, w_mouse_buttons}) == 32'b0;
+// MCU 可配置的鼠标参数（上电默认匹配当前已知鼠标）
+reg [7:0]  cfg_mouse_report_len;
+reg [7:0]  cfg_mouse_useful_data_len;
+reg [7:0]  cfg_mouse_interval;
+
+assign LED = (reg_kbd_d1 | reg_kbd_d2 | reg_mouse_d1 | reg_mouse_d2) == 32'b0;
 
 // ==========================================================
 // 数据锁存与 W1C(写1清零) 状态机 (加入影子锁存抗撕裂)
@@ -153,6 +156,9 @@ always @(posedge apb_clock) begin
         reg_kbd_d2   <= 32'b0;
         reg_mouse_d1 <= 32'b0;
         reg_mouse_d2 <= 32'b0;
+        cfg_mouse_report_len      <= 8'd13;
+        cfg_mouse_useful_data_len <= 8'd7;
+        cfg_mouse_interval        <= 8'd1;
     end else begin
         // --- 1. 键盘数据锁存与状态更新 ---
         if (w_kbd_data_valid) begin
@@ -163,14 +169,21 @@ always @(posedge apb_clock) begin
             reg_status[0] <= 1'b0;
         end
         
-        // --- 2. 鼠标数据处理 ---
+        // --- 2. 鼠标数据处理（原始字节透传，MCU 侧按 profile 解析） ---
         // 步骤 A: 前端无条件捕获物理层脉冲，杜绝漏包
         if (w_mouse_data_valid) begin
-            reg_mouse_d1 <= {w_mouse_y, w_mouse_x};
-            reg_mouse_d2 <= {8'h00, w_mouse_wheel, w_mouse_buttons};
+            reg_mouse_d1 <= w_mouse_raw[31:0];
+            reg_mouse_d2 <= w_mouse_raw[63:32];
             reg_status[1] <= 1'b1;
         end else if (apb_pwrite && apb_penable && apb_paddr[11:0] == ADDR_STATUS && apb_pwdata[1]) begin
             reg_status[1] <= 1'b0;
+        end
+        
+        // --- 3. 鼠标配置寄存器写入（MCU 通过 APB 写入，receiver 下一轮询周期生效） ---
+        if (apb_pwrite && apb_penable && apb_paddr[11:0] == ADDR_MOUSE_CFG) begin
+            cfg_mouse_report_len       <= apb_pwdata[7:0];
+            cfg_mouse_useful_data_len  <= apb_pwdata[15:8];
+            cfg_mouse_interval         <= apb_pwdata[23:16];
         end
     end
 end
@@ -222,10 +235,11 @@ Mouse_Receiver #(
     .o_SPI_CS_n             (o_mouse_SPI_CS_n),
     .i_CH374_INT_n          (i_mouse_CH374_INT_n),
     
-    .o_mouse_buttons        (w_mouse_buttons),
-    .o_mouse_x              (w_mouse_x),
-    .o_mouse_y              (w_mouse_y),
-    .o_mouse_wheel          (w_mouse_wheel),
+    .i_cfg_report_len       (cfg_mouse_report_len),
+    .i_cfg_useful_data_len  (cfg_mouse_useful_data_len),
+    .i_cfg_interval         (cfg_mouse_interval),
+    
+    .o_mouse_raw            (w_mouse_raw),
     .o_mouse_data_valid     (w_mouse_data_valid)
 );
 

@@ -13,7 +13,7 @@ module Kbd_Receiver
 )
 (
     // 系统时钟与复位
-    input                   clk,                    // 系统时钟50MHz
+    input                   clk,                    // 系统时钟40MHz
     input                   rst_n,                  // 系统复位，低电平有效
     
     // CH374T SPI接口
@@ -571,7 +571,7 @@ always @(posedge clk) begin
                 end else if(spi_resp_valid && op_step == 4'd5) begin
                     op_step <= 4'd6;
                 end else if(spi_req_ready && !spi_req_valid && op_step == 4'd6) begin
-                    // 步骤3：下发 SETUP 令牌到 EP0 (PID=0xD, EP=0x0 -> 0xD0) 
+                    // 步骤4：下发 SETUP 令牌到 EP0 (PID=0xD, EP=0x0 -> 0xD0)
                     spi_write_reg(REG_USB_H_TOKEN, 8'hD0);
                     op_step <= 4'd7;
                 end else if(spi_resp_valid && op_step == 4'd7) begin
@@ -750,7 +750,7 @@ always @(posedge clk) begin
                 end else if(spi_resp_valid && (op_step == 4'd6 || op_step == 4'd7 || op_step == 4'd8)) begin
                     if (op_step == 4'd6) op_step <= OP_FINISH;      // 有效数据，去 S_POLL_EP1_READ 读包
                     else if (op_step == 4'd7) op_step <= OP_RESET;  // NAK，去 S_POLL_WAIT 等待下一回合
-                    else op_step <= OP_ERR;                         // [新增] 方案二：抛出错误标志，强制触发状态机跳转到 S_ERROR
+                    else op_step <= OP_ERR;                         // 异常PID，跳转 S_ERROR 重新枚举
                 end 
             end
             

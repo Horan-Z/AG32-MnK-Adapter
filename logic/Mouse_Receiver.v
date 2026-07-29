@@ -7,13 +7,11 @@ module Mouse_Receiver
     // 系统参数
     parameter   SYS_CLK_FREQ            = 40_000_000,    // 系统时钟频率，单位Hz
     parameter   SPI_CLKS_PER_HALF_BIT   = 2,
-    parameter   INTERVAL                = 8'd01,
-    parameter   REPORT_LEN              = 8'd13,
-    parameter   USEFUL_DATA_LEN         = 8'd7
+    parameter   MAX_DATA_LEN            = 8'd8    // 缓冲区大小（编译期固定，运行时由 i_cfg_useful_data_len 控制实际读取长度）
 )
 (
     // 系统时钟与复位
-    input                   clk,                    // 系统时钟50MHz
+    input                   clk,                    // 系统时钟40MHz
     input                   rst_n,                  // 系统复位，低电平有效
     
     // CH374T SPI接口
@@ -24,11 +22,13 @@ module Mouse_Receiver
     
     input                   i_CH374_INT_n,
     
-    output reg        [15:0] o_mouse_buttons,
-    output reg signed [15:0] o_mouse_x,
-    output reg signed [15:0] o_mouse_y,
-    output reg signed [7:0]  o_mouse_wheel,
-    output reg               o_mouse_data_valid
+    // MCU 可配置参数（运行时写入，下一轮询周期生效）
+    input [7:0]             i_cfg_report_len,       // 期望的 USB 报告长度
+    input [7:0]             i_cfg_useful_data_len,   // 实际读取的字节数
+    input [7:0]             i_cfg_interval,          // 轮询周期(ms)
+    
+    output reg [63:0]       o_mouse_raw,            // 原始报告字节（最多8字节，MCU侧解析）
+    output reg              o_mouse_data_valid
 );
 
 // ********************************************************************
@@ -250,7 +250,7 @@ end
 
 genvar i;
 generate
-    for(i = 0; i < USEFUL_DATA_LEN; i = i + 1) begin : gen_mouse_data
+    for(i = 0; i < MAX_DATA_LEN; i = i + 1) begin : gen_mouse_data
         assign spi_resp_rdata[i] = spi_rdata_buf[i];
     end
 endgenerate
@@ -409,10 +409,7 @@ always @(posedge clk) begin
         op_step <= 4'd0;
         ep1_in_toggle <= 1'b0;
         dev_is_low_speed <= 1'b0;
-        o_mouse_buttons <= 16'd0;
-        o_mouse_x <= 16'd0;
-        o_mouse_y <= 16'd0;
-        o_mouse_wheel <= 8'd0;
+        o_mouse_raw <= 64'd0;
         o_mouse_data_valid <= 1'b0;
         delay_ms_cnt <= 8'd0;
     end else begin
@@ -568,7 +565,7 @@ always @(posedge clk) begin
                 end else if(spi_resp_valid && op_step == 4'd5) begin
                     op_step <= 4'd6;
                 end else if(spi_req_ready && !spi_req_valid && op_step == 4'd6) begin
-                    // 步骤3：下发 SETUP 令牌到 EP0 (PID=0xD, EP=0x0 -> 0xD0) 
+                    // 步骤4：下发 SETUP 令牌到 EP0 (PID=0xD, EP=0x0 -> 0xD0)
                     spi_write_reg(REG_USB_H_TOKEN, 8'hD0);
                     op_step <= 4'd7;
                 end else if(spi_resp_valid && op_step == 4'd7) begin
@@ -672,7 +669,7 @@ always @(posedge clk) begin
             // ---------------- 非脉冲模式适配的轮询逻辑 ----------------
             S_POLL_WAIT: begin
                 if(op_step == 4'd0) begin
-                    delay_ms_cnt <= INTERVAL;
+                    delay_ms_cnt <= i_cfg_interval;
                     op_step <= OP_FINISH;
                 end
             end
@@ -719,7 +716,7 @@ always @(posedge clk) begin
                 end else if(spi_resp_valid && (op_step == 4'd6 || op_step == 4'd7 || op_step == 4'd8)) begin
                     if (op_step == 4'd6) op_step <= OP_FINISH;      // 有效数据，去 S_POLL_EP1_READ 读包
                     else if (op_step == 4'd7) op_step <= OP_RESET;  // NAK，去 S_POLL_WAIT 等待下一回合
-                    else op_step <= OP_ERR;                         // [新增] 方案二：抛出错误标志，强制触发状态机跳转到 S_ERROR
+                    else op_step <= OP_ERR;                         // 异常PID，跳转 S_ERROR 重新枚举
                 end 
             end
             
@@ -729,8 +726,8 @@ always @(posedge clk) begin
                     spi_read_reg(REG_USB_LENGTH, 8'd1);
                     op_step <= 4'd1;
                 end else if(spi_resp_valid && op_step == 4'd1) begin
-                    // 步骤2：长度校验
-                    if (spi_resp_rdata[0] == REPORT_LEN) begin
+                    // 步骤2：长度校验（使用 MCU 配置的期望长度）
+                    if (spi_resp_rdata[0] == i_cfg_report_len) begin
                         op_step <= 4'd2;
                     end else begin
                         // 长度不吻合，直接丢弃
@@ -738,14 +735,13 @@ always @(posedge clk) begin
                         op_step <= OP_FINISH;
                     end
                 end else if(spi_req_ready && !spi_req_valid && op_step == 4'd2) begin
-                    // 步骤3：读取实际的 13 字节负载数据
-                    spi_read_reg(RAM_HOST_RECV, USEFUL_DATA_LEN);
+                    // 步骤3：读取实际负载数据（字节数由 MCU 配置）
+                    spi_read_reg(RAM_HOST_RECV, i_cfg_useful_data_len);
                     op_step <= 4'd3;
                 end else if(spi_resp_valid && op_step == 4'd3) begin
-                    o_mouse_buttons <= {spi_resp_rdata[1], spi_resp_rdata[0]};
-                    o_mouse_x       <= {spi_resp_rdata[3], spi_resp_rdata[2]};
-                    o_mouse_y       <= {spi_resp_rdata[5], spi_resp_rdata[4]};
-                    o_mouse_wheel   <=  spi_resp_rdata[6];
+                    // 原始字节透传，MCU 侧按 profile 解析
+                    o_mouse_raw <= {spi_resp_rdata[7], spi_resp_rdata[6], spi_resp_rdata[5], spi_resp_rdata[4],
+                                    spi_resp_rdata[3], spi_resp_rdata[2], spi_resp_rdata[1], spi_resp_rdata[0]};
                     o_mouse_data_valid <= 1'b1;
                     ep1_in_toggle <= ~ep1_in_toggle;
                     op_step <= OP_FINISH;
@@ -757,10 +753,7 @@ always @(posedge clk) begin
                     delay_ms_cnt <= 8'd250;
                     op_step <= 4'd1;
 
-                    o_mouse_buttons <= 16'd0;
-                    o_mouse_x <= 16'd0;
-                    o_mouse_y <= 16'd0;
-                    o_mouse_wheel <= 8'd0;
+                    o_mouse_raw <= 64'd0;
                     o_mouse_data_valid <= 1'b1;
                 end
                 dev_is_low_speed <= 1'b0;
